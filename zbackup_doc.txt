@@ -1,0 +1,883 @@
+zbackup: средство архивации с дедупликацией, сжатием и шифрованием на GNU/Linux
+
+Вышла в свет новая версия (1.2) утилиты для резервного копирования zbackup от Константина Исакова (http://zbackup.org/). Утилита примечательна своей дедупликацией, основанной на принципах rsync. Также имеется сжатие и шифрование. zbackup создаёт инкрементальный бэкап, при этом ей не свойственна сложность восстановления из бэкапов.
+Update: use set -e in scripts
+Плюсы:
+«Глобальная» дедупликации на уровне байт, а не блоков (как в ZFS или obnam (http://liw.fi/obnam/)). Данные, полученные в разное время из разных образов, сохраняются только один раз. За счет этого достигается высокая инкрементальность и низкие затраты дискового пространства. Для достижения данной функциональности программа использует кольцевую хэш-функцию со скользящим окном для побайтной проверки на совпадение с уже существующими блоками данных, наподобие того, как это реализовано в программе rsync.
+За счёт вышеуказанного - низкие требования к пропускной способности сети. Нагрузка на сеть идёт только во время первого изначального бэкапа. Все последующие бэкапы передают минимум дедуплицированных, сжатых, изменившихся данных.
+Многопоточное сжатие данных с помощью алгоритма LZMA. Сжатие происходит эффективно. На данный момент алгоритм сжатия не меняется, но планируется в будущем.
+Встроенное в программу опциональное шифрование AES. Стойкое шифрование полезно для архивации в чужое облако, к примеру.
+Простота создания и восстановления из бэкапов. Команды очень простые и никаких сложностей при восстановлении из инкрементальных бэкапов - данные из них восстанавливаются с такой же лёгкостью, как и из полных.
+Возможность использования множеством пользователей  и безопасность для использования на реальных данных. Так как программа никогда не модифицирует существующие файлы, добавляя только новые, достаточно после сохранения бэкапа просто восстановить его обратно в /dev/null. Для каждого бэкапа сохраняется его SHA256-сумма, проверяемая при восстановлении. Если восстановление прошло успешно, значит, оно будет так же успешно и в будущем. Объем кода, который осуществляет подсчет SHA256-суммы на входе и сверяет его на выходе очень мал и легко поддается аудиту.
+Минусы:
+Отсутствует в стандартных репозиториях. 
+Нет версии для Windows, хотя автор обещает, что её создание дело несложное. Только надо собрать её под Windows. При сборке, конечно, придется решить все проблемы, которые возникнут, однако сам дизайн программы рассчитан на то, чтобы быть использованной на разных системах (все платформозависимые вещи живут в отдельных .hh/.cc файлах и т.п.)
+
+Cжатие достаточно CPU-прожорливое. Хотя сжатие сильно грузит лишь в первый бэкап (все данные недуплицированы и сжимается большой их объём. Нет  возможности изменить тип сжатия на другой, хотя можно архитектура программы позволяет.
+Нет возможности удалять старые бэкапы, но по заверениям автора такая возможность появится в будущем, так как удаление старых данных изначально предусмотрено архитектурой бэкапов
+Нет возможности прямого доступа к любому из файлов в бэкапе, а работа происходит только через STDIN/STDOUT. Эта проблема решается с помощью fuse, но код не реализован. 
+Стоит отметить, что данные подавать в программу надо в несжатом и нешифрованном виде (например, то, что выдает tar c), иначе дедупликацию произвести не получится. Лучше всего подавать большие файлы типа несжатых .tar или сырых дисковых образов. Результирующий репозиторий можно копировать на другие машины с помощью rsync, через sshfs или же хранить в любых облачных хранилищах, в которых можно хранить обычные файлы. Так как программа никогда не модифицирует уже существующие файлы, последнее довольно удобно - достаточно просто не копировать те файлы, которые уже есть на удаленном хранилище. А встроенное шифрование позволяет не заботится о конфиденциальности хранимых там данных.
+Домашняя страница программы: http://zbackup.org/
+Страница разработки на github: https://github.com/zbackup/zbackup/
+Спасибо автору программы за программу из отзывчивость.
+
+В общем идея создать одну помойку, склад, один архив для всех конечных компьютеров. Что это нам даёт? Дедупликация нам должна дать размер архива, скажем, 10 машин Debian Wheezy с данными по 100 Гбайт - в… ~100 Гбайт за счёт повторяющихся данных.
+Всё ниже описанное - моя версия реализации архивации, с чем мне пришлось столкнуться и какие вопросы/проблемы решать. Замечания приветствуются.
+
+Вопросы:
+1)  Как лучше настроить архивацию
+2) Как лучше передавать архив
+3) Где на архив-сервере хранить весь архив («репозиторий»)?
+4) Как обеспечить многопользовательность (исходит из п.1)
+5) Как обеспечить безопасность архива
+
+Ответы:
+
+1)	Как лучше настроить архивацию:
+Собственно вариантов 2:
+- Конечный компьютер архивирует на архив-сервер
+- Архив-сервер «обходит» конечные компьютеры и архивирует себе данные
+
+Был выбран первый вариант, так как это сохранит полосу пропускания и ресурсы сервера, а также увеличит безопасность - компрометация архив-сервера не поставит под угрозу все компьютеры, а компрометация конечного компьютера поставит под угрозу лишь эту учётную запись на архив-сервере.
+2)	Как лучше передавать архив:
+Выбран sshfs, как безопасный и универсальный. SMB/CIFS и NFS отпадают ввиду отсутсвия шифрования и безопасности. Также sshfs позволяет не сохранять архивные данные на локальном копьютере, а сразу передавать их на архив-сервер.
+3)	Где на архив-сервере хранить весь архив («репозиторий»)?
+На системах Debian есть пользователь backup  с домашней директорией /var/backups, но она не рекомендуется к использованию http://unix.stackexchange.com/questions/68698/is-it-bad-dangerous-inappropriate-to-put-arbitrary-backups-in-var-backups, либо просто недостаточно документирована в FHS (Filesystem Hierarchy Standard)
+http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=122038 и используется другими приложениями для своих целей http://www.tldp.org/LDP/Linux-Filesystem-Hierarchy/html/var.html, к тому же предложенная схема архивации подразумевает множество пользователей, что затруднит их администрирование. Поэтому выбрана директория /home/archive. Она может использоваться для других программ архивации, поэтому для zbackup в ней будет папка zbackup.
+4)	Как обеспечить многопользовательность (исходит из п.1)
+Так как был выбран вариант, когда конечный компьютер архивирует данные на архив-сервер, необходимо каждому такому компьютеру завести учётную записть в GNU/Linux.
+5)	Как обеспечить безопасность архива
+Итак:
+	- Группу пользователей архива заключим в ssh chroot.
+	- Так как архив (на сленге zbackup и далее «репозиторий») создаётся с дедупликацией, то обычное удаление файлов пользователем удалит также и блоки данных других пользователей, что приведёт к ошибкам, поэтому никто не может удалять данные с архива (включая пользователя root).
+	- У пользователя будет возможность записывать в архив, но восстанавливать только свои файлы.
+
+Устанавливаем zbackup на архив-сервер и на каждый конечный компьютер
+
+Эти действия выполняются одноразово на архив-сервере и на каждом конечном компьютере, с которого будет производиться архивация.
+Устанавливаем зависимости:
+aptitude update 
+aptitude -y install checkinstall build-essential
+ (или просто g++)
+aptitude -y install cmake libssl-dev libprotobuf-dev liblzma-dev zlib1g-dev protobuf-compiler 
+mkdir -p /root/zbackup/src && cd /root/zbackup/src
+Скачиваем исходники:
+wget https://github.com/zbackup/zbackup/archive/1.2.tar.gz
+Собираем из исходников:
+tar -zxvf ./1.2.tar.gz
+cd ./zbackup-1.2/
+cmake .
+make
+checkinstall
+
+
+Настраиваем домашний каталог группы архивации (скрипт)
+
+Эти действия выполняем одноразово на архив-сервере.
+#!/bin/sh
+ARCHIVE_DIR='/home/archive/'    # Каталог, где будут находиться все архивы, включая выполненные другими программами архивации. 
+ZBACKUP_DIR='/home/archive/zbackup'    # Где будут храниться все файлы zbackup
+ZBACKUP_GROUP='zbackup'    # Группа пользователей zbackup
+
+## Добавляем группу
+groupadd $ZBACKUP_GROUP
+
+## Создаём каталог для файлов с архивом
+mkdir $ARCHIVE_DIR
+## Создаём в нём каталог .ssh и файл authorized_keys в нём, который будет хранить ключи удалённых пользователей.
+mkdir $ARCHIVE_DIR/.ssh
+touch $ARCHIVE_DIR/.ssh/authorized_keys
+## Добавляем во владельцев файла группу архивации
+chown root:$ZBACKUP_GROUP $ARCHIVE_DIR/.ssh/authorized_keys
+## Группа должна иметь доступ на чтение, чтобы успешно аутентифицироваться
+chmod 0640 $ARCHIVE_DIR/.ssh/authorized_keys
+
+
+Создаём репозиторий, пригодный для работы множества пользователей (скрипт)
+
+Эти действия выполняем одноразово на архив-сервере.
+#!/bin/sh
+
+ZBACKUP_DIR='/home/archive/zbackup'    # Где будут храниться все файлы zbackup
+ZBACKUP_GROUP='zbackup'    # Группа пользователей zbackup
+
+mkdir $ZBACKUP_DIR
+## Инициализируем репозиторий (создаём структуру)
+zbackup init --non-encrypted $ZBACKUP_DIR
+
+## Создадим временную директорию. Она нужна для работы программы, а также чтобы пользователь не создавал её со своими правами и другие пользователи, архивирующие в этот момент, смогли получить доступ к ней.
+mkdir $ZBACKUP_DIR/tmp
+
+## Даём пользователям нашей группы возможность записывать в репозиторий
+## Для этого делаем владельцем репозитория нашу группу
+chown :$ZBACKUP_GROUP -R $ZBACKUP_DIR
+## И даём права на запись и чтение из репозитория
+chmod -R 0770 $ZBACKUP_DIR
+## Отдельно установим права для файла info
+chmod 0640 $ZBACKUP_DIR/info
+## Защищаем наш репозиторий от изменений и удалений каталогов
+chattr +a $ZBACKUP_DIR
+
+Запускаем скрипт по корректировке прав доступа на сервере
+
+Это есть небольшой костыль, но надеюсь удастся договориться с автором программы, чтобы права устанавливались программой автоматически.
+Для этого нам понадобится утилита inotifywait из пакета inotify-tools:
+aptitude update && aptitude install inotify-tools
+
+vi $ARCHIVE_DIR/zbackup_inotifywait.sh
+
+#!/bin/bash
+
+ZBACKUP_DIR='/home/archive/zbackup'
+
+## Эта функция отслеживает создание и перемещение файлов/каталогов в папке $ZBACKUP_DIR/bundles/ $ZBACKUP_DIR/index/, задаёт им права 0440 для файлов, чтобы можно было их читать группе в случае восстановления из архива, а также устанавливает атрибут против удаления кем бы то ни было, и 0770 для директорий, чтобы группа могла видеть каталоги и файлы
+function rest {
+
+inotifywait -mrq -e moved_to -e create --format "%w%f" $ZBACKUP_DIR/bundles/ $ZBACKUP_DIR/index/ | while read "FILE"
+
+        do
+        if [ -f "$FILE" ]; then
+                chmod 0440 "$FILE"
+                chattr +i "$FILE"
+        elif [ -d "$FILE" ]; then
+                chmod -R 0770 "$FILE"
+        fi
+        done 
+
+}
+
+## Эта функция отслеживает $ZBACKUP_DIR/backups и работает как указанная выше, только права для файлов более строгие - 0400, чтобы пользователи не могли восстанавливать данные из архивов других пользователей, для директорий права - 0700, чтобы другие пользователи не могли видеть даже структуру архива.
+function backups {
+
+inotifywait -mrq -e moved_to -e create --format "%w%f" $ZBACKUP_DIR/backups/  | while read "FILE"
+
+        do
+        if [ -f "$FILE" ]; then
+                chmod 0400 "$FILE"
+                chattr +i "$FILE"
+        elif [ -d "$FILE" ]; then
+                chmod -R 0700 "$FILE"
+        fi
+        done
+}
+
+rest &
+backups &
+
+Процесс будет работать  на сервере от пользователя root, соответственно изменяем права:
+chmod 0700 $ARCHIVE_DIR/zbackup_inotifywait.sh
+Запускаем:
+$ARCHIVE_DIR/zbackup_inotifywait.sh
+
+Настраиваем sshfs/stfp chroot
+
+Эти действия выполняем одноразово на архив-сервере.
+sshfs chroot необходим, чтобы пользователи из группы zbackup были ограничены своей домашней директорией и не видели файловой системы сервера. 
+
+В файле /etc/ssh/sshd_config
+Закомментируем 
+#Subsystem sftp /usr/lib/openssh/sftp-server
+И пропишем в конце:
+Subsystem sftp internal-sftp
+Match Group zbackup
+        ChrootDirectory /home/archive/
+        ForceCommand internal-sftp
+        X11Forwarding no
+        AllowTCPForwarding no
+Примечание: Заменить группу zbackup и путь /home/archive, если бы выбрали другие значения в  $ZBACKUP_GROUP и $ARCHIVE_DIR соответственно.
+service ssh restart
+Создание пользователя:
+
+На клиенте (скрипт)
+
+Эти действия выполняем на конечном компьютере одноразово для каждого пользователя.
+
+Создаём ключ для входа на архив-сервер:
+#!/bin/sh
+ZBACKUP_USER='alma-test-1'
+ssh-keygen -t rsa -C "$ZBACKUP_USER"@zbackup -f ~/.ssh/id_"$ZBACKUP_USER"_zbackup
+При запросе ввода пароля – просто нажимаем ENTER, не устанавливая пароль – у нас процесс архивации автоматический и никто не будет вводить этот пароль автоматически.
+
+На сервере (скрипт)
+
+Эти действия выполняем на архив-сервере для каждого пользователя.
+Содержимое нашего публичного ключа (~/.ssh/id_"$ZBACKUP_USER"_zbackup.pub), созданного в предыдущем пункте, добавляем вручную пользователем root на сервере в папку $ARCHIVE_DIR/.ssh/authorized_keys и создаём пользователя:
+#!/bin/sh
+
+echo "Введите имя нового пользователя"
+read ZBACKUP_USER
+
+ZBACKUP_GROUP='zbackup'
+
+ARCHIVE_DIR='/home/archive/'   
+
+ZBACKUP_DIR='/home/archive/zbackup'
+
+## Добавляем пользователя в систему. Задаём любой стойкий пароль, но он не важен, так как будет авторизация по ключу.
+adduser --home $ARCHIVE_DIR --shell /bin/false --no-create-home --ingroup $ZBACKUP_GROUP $ZBACKUP_USER
+
+## Создаём каталог, где будут храниться данные об архивах пользователя
+mkdir $ZBACKUP_DIR/backups/$ZBACKUP_USER
+
+## Делаем нашего пользователя владельцем своего же каталога
+chown $ZBACKUP_USER:$ZBACKUP_GROUP $ZBACKUP_DIR/backups/$ZBACKUP_USER
+
+## И ограничиваем доступ - только этот пользователь имеет доступ к своему каталогу чтобы только он мог восстановить свои же данные
+chmod 700 $ZBACKUP_DIR/backups/$ZBACKUP_USER
+
+
+
+Архивация с конечного компьютера Linux
+
+Будем применять 2 основных видов архивации:
+1)	Архивация каталогов и/или файлов
+2)	Архивация блочных устройств.
+
+
+Принципы:
+1)	Так как с архивацией (настроил и забыл) и деархивацией приходится сталкиваться редко, то комментарии к выполняемым командам важны.
+2)	Стараемся все архивные файлы размещать в каталогах для лёгкой их идентификации (mbr, folders, lvm и т.д.).
+3)	Имена файлов даём с учётом какая программа была использована для архивации и тип данных (имя.tar или имя.sfdisk.txt).
+На конечном компьютере нужно установить sshfs
+aptitude update && aptitude install sshfs
+
+Вынесем все одинаковые настойки в отдельный файл /root/zbackup/backup.conf:
+
+## Настройки удалённого сервера архивации
+## IP-адрес или FQDN
+SERVER_ADDRESS='95.56.233.234'
+
+## Порт (обычно 22)
+SERVER_SSH_PORT='222'
+
+## Пользователь под которым заходить на архив-сервер
+ZBACKUP_USER='alma-test-1'
+
+## Какую директорию подключать на сервере. При использовании chroot (по-умолчанию) рекомендуется оставить '/'.
+SERVER_MOUNT_POINT='/'
+
+## Точка монтирования на конечном компьютере. Папка может не существовать.
+LOCAL_MOUNT_POINT='/mnt/archive'
+
+## Устанавливаем переменную PATH (необходимо для cron)
+PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+Архивация каталогов и файлов (скрипт)
+
+Данный скрипт архивирует почти все значимые каталоги с содержимым в корне системы. Этот вид архивации удобен для выборочного восстановления файлов. Рекомендую закинуть в cron с ежедневным исполнением, так как архивация не ресурсно-затратная для конечного компьютера.
+
+folders_weekly.sh
+
+#!/bin/bash
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 started... "
+
+## Каталоги и файлы к архивации через пробел, без запятых, начинающиеся с '/'
+DIRS='/boot/ /bin/ /lib/ /sbin/ /selinux/ /usr/ /initrd.img /vmlinuz'
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём точку монтирования
+mkdir $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог в точку монтирования с авторизацией по ключу
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+##  Для каждой указанной директории
+for DIR in $DIRS
+    do  
+        ## Создаём директорию на архив-сервере
+        mkdir -p $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/folders$DIR 2>/dev/null
+
+        ## Архивируем при помощи tar (без сжатия!)
+        tar --one-file-system --ignore-failed-read -cf - $DIR  2>/dev/null | zbackup --silent backup $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/folders$DIR/`date '+%Y%m%d-%H-%M'`.tar
+    done
+
+## =================
+## Каталог /var отдельно ввиду множества исключений (http://www.debian.org/doc/manuals/debian-reference/ch10.en.html#_backup_and_recovery)
+## Добавьте свои исключения при необходимостий
+DIR='/var/ --exclude=/var/agentx --exclude=/var/cache --exclude=/var/run --exclude=/var/tmp --exclude=/var/lock --exclude=/var/log --exclude=/var/spool/squid3'
+
+## Создаём каталог /var
+mkdir -p $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/folders/var 2>/dev/null
+
+## Архивируем с помощью tar (без сжатия!)
+tar --one-file-system --ignore-failed-read -cf - $DIR  2>/dev/null | zbackup --silent backup $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/folders/var/`date '+%Y%m%d-%H-%M'`.tar
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 completed "
+
+
+folders_daily.sh
+
+#!/bin/bash
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 started... "
+
+## Каталоги и файлы к архивации через пробел, без запятых, начинающиеся с '/'
+DIRS='/etc/ /root/ /home/ /opt/ /srv/ /var/log/'
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём точку монтирования
+mkdir $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог в точку монтирования с авторизацией по ключу
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+##  Для каждой указанной директории
+for DIR in $DIRS
+    do  
+        ## Создаём директорию на архив-сервере
+        mkdir -p $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/folders$DIR 2>/dev/null
+
+        ## Архивируем при помощи tar (без сжатия!)
+        tar --one-file-system --ignore-failed-read -cf - $DIR  2>/dev/null | zbackup --silent backup $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/folders$DIR/`date '+%Y%m%d-%H-%M'`.tar
+    done
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 completed "
+
+Архивация MBR c таблицей разделов и загрузчика (скрипт)
+
+Данный скрипт архивирует MBR, включая таблицу разделов диска и загрузчик в двоичном виде и таблицу разделов (включая расширенных) в текстовом виде, как выводит команда sfdisk. Этот вид архивации необходим для полного восстановления системы. Рекомендую закинуть в cron с еженедельным исполнением, так как MBR редко меняется.
+
+bootloader+partition_table.sh
+
+#!/bin/bash
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 started... "
+
+## Имя диска, где расположен MBR
+DISK='/dev/vda'
+
+## Сколько секторов архивировать с начала диска
+## Проверить можно так:
+## fdisk -l
+##   Device Boot      Start         End      Blocks   Id  System
+## /dev/sda1   *        2048      499711      248832   83  Linux
+## /dev/sda2          501758   104855551    52176897    5  Extended
+## /dev/sda5          501760   104855551    52176896   8e  Linux LVM
+## Первый раздел начинается с сектора 2048, значит указывать 2048
+## Если не кратно 2048, то стоит задуматься о переразбивке диска с целью
+## дальнейшей совместимости с 4K-дисками и RAID:
+## http://www.ibm.com/developerworks/linux/library/l-4kb-sector-disks/
+SECTORS=2048
+
+## Логический размер сектора (cat /sys/block/sdX/queue/logical_block_size)
+SECTOR_SIZE=512
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём локальную точку монтирования
+mkdir -p $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог в локальную точку монтирования
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+## Создаём каталог на архив-сервере, куда будут размещаться бэкапы
+mkdir -p $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/bootloader+partition_table/{bootloader,partition_table} 2>/dev/null
+
+## Архивируем загрузочик и таблицу разделов (без расширенных разделов)
+dd if=$DISK bs=$SECTOR_SIZE count=$SECTORS 2>/dev/null | zbackup --silent backup $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/bootloader+partition_table/bootloader/`date '+%Y%m%d-%H-%M'`.dd.bin
+
+## Архивируем таблицу разделов (с расширенными разделами)
+sfdisk -d $DISK 2>/dev/null | zbackup --silent backup $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/bootloader+partition_table/partition_table/`date '+%Y%m%d-%H-%M'`.sfdisk.txt
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 completed "
+
+
+Архивация данных раздела диска (скрипт)
+
+Данный скрипт архивирует весь раздел со всем содержимым бинарно. Необходимо учитывать, что раздел должен быть размонтирован. Для активно использующихся системой разделов необходимо использовать техники LVM (ниже). Этот вид архивации необходим для полного восстановления системы. Размещение в cron делается в соответствии с частотой изменения раздела.
+Заполняем свободное пространство нулями, чтобы улучшить последующие дедупликацию и сжатие. Рекомендуется делать одноразово.
+dd if=/dev/zero of=$MOUNT_POINT/.zeros.tmp bs=10M 2>/dev/null
+rm $MOUNT_POINT/.zeros.tmp
+
+partition_<имя_раздела>.sh
+
+#!/bin/bash
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 started... "
+
+## Имя раздела, который будет отмонтирован и скопирован
+PARTITION='/dev/vda1'
+
+NICE_NAME=$(echo $PARTITION | awk -F/ '{print $3}')
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём локальную точку монтирования
+mkdir -p $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог в локальную точку монтирования
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+## Создаём каталог на архив-сервере, куда будут размещаться бэкапы
+mkdir -p $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/partition/$NICE_NAME 2>/dev/null
+
+## Отмонтируем раздел
+umount $PARTITION
+
+## Архивируем
+dd if=$PARTITION bs=10M conv=noerror 2>/dev/null | zbackup --silent backup $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/partition/$NICE_NAME/`date '+%Y%m%d-%H-%M'`.dd.bin
+
+## Монтируем раздел обратно
+mount $PARTITION
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 completed "
+
+Архивация метаданных LVM (скрипт)
+
+Данный скрипт архивирует метаданные LVM (все данные об определённой VG - включая данные по PV), на основании которых можно будет восстановить информацию о PV, VG и все LV в изначальном виде. Пользовательские данные с разделов не архивируются! Архивация в текстовом виде, как выводит команда vgcfgbackup. Этот вид архивации необходим для полного восстановления системы. Рекомендую закинуть в cron с еженедельным исполнением, так как .
+
+lvm_metadata.sh
+
+#!/bin/bash
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 started... "
+
+## Название группы разделов (VG)
+VG='alma-home-x'
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём локальную точку монтирования
+mkdir -p $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог архив-сервера в локальную точку монтирования
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+## Создаём каталог для архивации LVM в удалённом каталоге
+mkdir -p $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/lvm/$VG/$LV 2>/dev/null
+
+## Создаём бэкап метаданных LVM. Это нужно для восстановления из архива метаданных PV, VG и LV.
+vgcfgbackup -f $VG.vgcfgbackup.temp $VG 1>/dev/null
+
+## Архивируем в текстовом виде
+cat $VG.vgcfgbackup.temp | zbackup --silent backup $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/lvm/$VG/`date '+%Y%m%d-%H-%M'`.vgcfgbackup.txt
+
+## Удаляем временный файл
+rm $VG.vgcfgbackup.temp
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 completed "
+
+Архивация пользовательских данных логического раздела LVM (скрипт)
+
+Данный скрипт архивирует логический раздел LVM в бинарном виде из снэпшота, соответственно можно делать при работающей системе. Этот вид архивации необходим для полного восстановления системы. Рекомендую закинуть в cron с еженедельным исполнением, так как это ресурсно-затратная операция.
+
+Заполняем свободное пространство нулями, чтобы улучшить последующие дедупликацию и сжатие. Рекомендуется делать одноразово.
+ВНИМАНИЕ! Это может привести к ошибкам в программах, которые в момент исчерпания места не смогут записать данные на диск!
+dd if=/dev/zero of=$MOUNT_POINT/.zeros.tmp bs=10M 2>/dev/null
+rm $MOUNT_POINT/.zeros.tmp
+
+Создаём для каждого раздела LV свой скрипт lvm_lv_$LV.sh
+ВНИМАНИЕ! В группе разделов должно быть свободное место для снэпшотов! Если его нету, необходимо подкорректировать скрипт и использовать, к примеру, место отключив swap раздел из LVM.
+#!/bin/bash
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 started... "
+
+## Название группы разделов (VG)
+VG='alma-home-x'
+
+## Имя логического раздела (LV) для резервирования
+LV='root'
+
+## Место для снэпшота (к примеру 500M, 5G). Оно должно быть доступно в VG! Его можно проверить командой vgs (VFree).
+SNAPSHOT_SIZE=900M
+
+## Указание LV-имени SWAP раздела в LVM. В случае нехватки места в VG для снэпшота, его необходимо удалить (код ниже)
+SWAP='swap'
+
+## Размер SWAP. В случае нехватки места в VG для снэпшота
+SWAP_SIZE=1G
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём локальную точку монтирования
+mkdir -p $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог архив-сервера в локальную точку монтирования
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+## Создаём каталог для архивации LVM в удалённом каталоге
+mkdir -p $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/lvm/$VG/$LV 2>/dev/null
+
+## Здесь можно внести необходимые команды по сбросу кэша ОС или БД на диск
+sync; sleep 2
+
+#############################################################################################
+#
+## Только если не хватает места в VG - удаляем SWAP раздел и создаём вместо него снэпшот
+## Отключаем SWAP
+swapoff /dev/$VG/"$SWAP"
+#
+## Удаляем SWAP-раздел
+lvremove -f /dev/$VG/"$SWAP" 1>/dev/null
+#
+#############################################################################################
+
+## Создаём снэпшот раздела
+lvcreate -L $SNAPSHOT_SIZE -s -n "$LV"_snapshot /dev/$VG/$LV 1>/dev/null
+
+## Архивируем из снэпшота в бинарном виде на архив-сервер
+dd if=/dev/$VG/"$LV"_snapshot bs=10M conv=noerror 2>/dev/null | zbackup --silent backup $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/lvm/$VG/$LV/`date '+%Y%m%d-%H-%M'`.dd.bin
+
+## Удаляем снэпшот
+lvremove -f /dev/$VG/"$LV"_snapshot 1>/dev/null
+
+#############################################################################################
+#
+## Только если не хватает места в VG продолжение - воссоздаём SWAP раздел и включаем его заново
+## Воссоздаём SWAP-раздел
+lvcreate -L $SWAP_SIZE -n "$SWAP" /dev/$VG 1>/dev/null
+#
+## Размечаем раздел как SWAP
+mkswap -f /dev/$VG/"$SWAP" >/dev/null
+#
+## Подключаем обратно SWAP
+swapon /dev/$VG/"$SWAP"
+#
+#############################################################################################
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+## Запись в лог
+logger -i -t zbackup "Backup script $0 completed "
+
+И записываем всё это в cron:
+
+/root/zbackup/zbackup_daily.sh
+
+#!/bin/sh
+
+## Выполняем с пониженным приоритетом по CPU (nice) и IO (ionice)
+TIME=`/usr/bin/time -f'%E' nice -n 19 ionice -c2 -n7 /root/zbackup/folders_daily.sh 2>&1`
+logger -i -t zbackup "Completion time: $TIME"
+
+
+/root/zbackup/zbackup_weekly.sh
+
+#!/bin/sh
+
+## Выполняем с пониженным приоритетом по CPU (nice) и IO (ionice)
+TIME=`/usr/bin/time -f'%E' nice -n 19 ionice -c2 -n7 /root/zbackup/bootloader+partition_table.sh 2>&1`
+logger -i -t zbackup "Completion time: $TIME"
+
+TIME=`/usr/bin/time -f'%E' nice -n 19 ionice -c2 -n7 /root/zbackup/lvm_metadata.sh 2>&1`
+logger -i -t zbackup "Completion time: $TIME"
+
+TIME=`/usr/bin/time -f'%E' nice -n 19 ionice -c2 -n7 /root/zbackup/partition_boot.sh 2>&1`
+logger -i -t zbackup "Completion time: $TIME"
+
+TIME=`/usr/bin/time -f'%E' nice -n 19 ionice -c2 -n7 /root/zbackup/folders_weekly.sh 2>&1`
+logger -i -t zbackup "Completion time: $TIME"
+
+TIME=`/usr/bin/time -f'%E' nice -n 19 ionice -c2 -n7 /root/zbackup/lvm_lv_root.sh 2>&1`
+logger -i -t zbackup "Completion time: $TIME"
+
+Не забываем chmod +x на всех скриптах!
+
+Далее делаем:
+(crontab -l ; echo "47 3 * * Mon-Sat /root/zbackup/zbackup_daily.sh ") | crontab -
+(crontab -l ; echo "47 3 * * Sun /root/zbackup/zbackup_weekly.sh ") | crontab -
+
+Готово!
+
+
+Обратная архивация
+
+Создание пользователя на архив-сервере, которым будем ходить по конечным компьютерам (устройствам).
+ZBACKUP_USER='alma-backup-1'
+ssh-keygen -t rsa -C "$ZBACKUP_USER"@zbackup -f ~/.ssh/id_"$ZBACKUP_USER"_zbackup
+
+
+Восстановление из архива
+
+Есть 2 основных способа восстановить данные:
+	- Восстановление файлов. Когда восстанавливается один или несколько нужных файлов или каталогов из архива и записывается в нужную папку.
+
+
+	- Бинарное восстановление данных. Когда восстанавливаются данные в бинарном виде - к примеру MBR, весь раздел или диск целиком.
+
+	Процесс полного бинарного восстановления диска:
+1)	Загрузить систему с LiveCD (Knoppix к примеру).
+2)	Восстановить MBR, таблицу разделов и загрузчик.
+3)	Восстановить (обычно) первый раздел /boot.
+4)	Восстановить метаданные LVM
+5)	Восстановить LV разделы LVM
+6)	Вручную подготовить swap
+7)	Загрузиться с жёсткого диска
+8)	Перепроверить udev (сетевые интерфейсы, к примеру).
+
+Вынесем все одинаковые настойки в отдельный файл ./backup.conf:
+## Настройки удалённого сервера архивации
+## IP-адрес или FQDN
+SERVER_ADDRESS='95.56.233.234'
+
+## Порт (обычно 22)
+SERVER_SSH_PORT='222'
+
+## Пользователь под которым заходить на архив-сервер
+ZBACKUP_USER='alma-test-1'
+
+## Какую директорию подключать на сервере. При использовании chroot рекомендуется оставить '/'.
+SERVER_MOUNT_POINT='/'
+
+## Точка монтирования на конечном компьютере. Папка может не существовать.
+LOCAL_MOUNT_POINT='/mnt/archive'
+
+## Устанавливаем переменную PATH (необходимо для cron)
+PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+Восстановление каталогов и файлов (скрипт)
+
+Скрипт восстанавливает каталоги и файлы из архива 
+#!/bin/bash
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём точку монтирования
+mkdir $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог в точку монтирования с авторизацией по ключу
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+FREE_MEM=$( free -m | grep 'buffers/cache' | awk '{print $4}')
+## Для увеличения производительности восстановления вводим вручную количество ОЗУ для zbackup
+echo "На системе свободно $FREE_MEM Мбайт ОЗУ. Введите сколько выделить для zbackup для ускорения процесса - в Мбайтах (для примера 512): "
+read USE_MEM
+echo "Используется $USE_MEM Мбайт для zbackup…"
+
+## Выводим список файлов для восстановления
+ls -lR $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/folders/
+## Вручную вводим нужный файл
+echo 'Введите имя файла для восстановления (в формате var/20130823-18-00.tar)… '
+read FILE
+
+## Создаём папку для восстановления
+mkdir -p $(echo "$FILE" | awk -F/ '{print $1}')
+zbackup --cache-size "$USE_MEM"mb restore $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/folders/$FILE > $FILE
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+
+
+Восстановление загрузочной записи и разделов диска (скрипт)
+
+1.mbr_and_partition_table.sh
+
+#!/bin/bash
+## Имя диска, куда будет записан MBR
+DISK='/dev/sdc'
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём локальную точку монтирования
+mkdir -p $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог в локальную точку монтирования
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+## Выводим список файлов загрузчика для восстановления
+ls -l $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/bootloader+partition_table/bootloader/
+## Вручную вводим нужный файл
+echo "Введите имя файла для восстановления загрузчика…"
+read FILE
+## Восстанавливаем загрузчик
+zbackup restore $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/bootloader+partition_table/bootloader/$FILE | dd of=$DISK
+## Выводим список файлов таблицы разделов для восстановления
+ls -l $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/bootloader+partition_table/partition_table/
+## Вручную вводим нужный файл
+echo "Введите имя файла для восстановления таблицы разделов…"
+read FILE
+## Восстанавливаем таблицу разделов
+zbackup restore $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/bootloader+partition_table/partition_table/$FILE | sfdisk $DISK
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+Восстановление данных раздела диска (скрипт)
+
+Данный скрипт восстанавливает весь раздел со всем содержимым бинарно. Необходимо учитывать, что раздел должен быть размонтирован. Для активно использующихся системой разделов необходимо использовать техники LVM (ниже). Этот вид архивации необходим для полного восстановления системы.
+2.partition_<имя раздела>.sh
+
+#!/bin/bash
+
+## Имя раздела, на который будет восстановлен образ
+PARTITION='/dev/sda1'
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём локальную точку монтирования
+mkdir -p $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог в локальную точку монтирования
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+FREE_MEM=$( free -m | grep 'buffers/cache' | awk '{print $4}')
+
+## Для увеличения производительности восстановления вводим вручную количество ОЗУ для zbackup
+echo "На системе свободно $FREE_MEM Мбайт ОЗУ. Введите сколько выделить для zbackup для ускорения процесса - в Мбайтах (для примера 512): "
+read USE_MEM
+echo "Используется $USE_MEM Мбайт для zbackup…"
+
+## Выводим список файлов для восстановления
+ls -lR $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/partition/
+
+## Вручную вводим нужный файл
+echo 'Введите имя файла для восстановления (в формате sda1/20130827-19-01.dd.bin)… '
+read FILE
+echo "Восстанавливаем $FILE…"
+sleep 2
+
+## Отмонтируем раздел, на который восстанавливаются данные
+umount $PARTITION
+
+## Восстанавливаем данные побайтно
+zbackup --cache-size "$USE_MEM"mb restore $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/partition/$FILE | dd of=$PARTITION bs=10M conv=noerror
+## Монтируем раздел заново, если он не описан в fstab, то выдаст ошибку
+mount $PARTITION
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+
+
+
+
+Восстановление метаданных LVM (скрипт)
+
+3.lvm_metadata.sh
+#!/bin/bash
+## Имя раздела диска, куда будут записаны метаданные LVM
+PARTITION='/dev/sdc5'
+
+## Название группы разделов (VG)
+VG='alma-test-1'
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём локальную точку монтирования
+mkdir -p $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог архив-сервера в локальную точку монтирования
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+
+## Выводим список файлов для восстановления
+ls -l $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/lvm/$VG
+
+## Вручную вводим нужный файл
+echo "Введите имя файла для восстановления…"
+read FILE
+echo "Восстанавливаем $FILE…"
+sleep 2
+
+## Восстанавливаем метаданные LVM из архива
+zbackup restore $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/lvm/$VG/$FILE > $VG.vgcfgbackup.temp
+## Выясняем UUID нужного нам PV. ВНИМАТЕЛЬНО! ПОДКОРРЕКТИРОВАТЬ ПОД ВАШУ КОНФИГУРАЦИЮ (может быть несколько PV на один VG, к примеру)!
+UUID=$(grep 'pv0 {' -A 1 $VG.vgcfgbackup.temp | grep id | awk '{print $3}' | sed 's/"//g')
+## Воссоздаём PV с предыдущим UUID
+echo "UUID раздела PV для восстановления: $UUID"
+echo 'Если значение UUID неверное или отсутствует, необходимо остановить скрипт (Ctrl+c). Если верно, то процесс продолжится через 10 секунд.'
+sleep 10
+pvcreate --restorefile $VG.vgcfgbackup.temp --uuid $UUID  $PARTITION
+
+## Восстанавливаем конфирурацию VG и LVs
+vgcfgrestore -f $VG.vgcfgbackup.temp $VG
+
+## Активируем VG
+vgchange -a y $VG
+## Удаляем временный файл
+rm $VG.vgcfgbackup.temp
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+Восстановление пользовательских данных разделов LVM (скрипт)
+
+Данный скрипт восстанавливает пользовательские данные на логическом разделе LVM в бинарном виде из архива.  
+
+4.lvm_lv_root.sh
+
+#!/bin/bash
+
+## Название группы разделов (VG)
+VG='alma-test-1'
+
+## Имя логического раздела (LV) для резервирования
+LV='root'
+
+## Имя логического раздела диска (LV), куда будут записаны данные пользователя
+LV_PARTITION="/dev/$VG/$LV"
+
+## Загружаем общие переменные
+source /root/zbackup/backup.conf
+
+## Создаём локальную точку монтирования
+mkdir -p $LOCAL_MOUNT_POINT 2>/dev/null
+
+## Подключаем удалённый каталог архив-сервера в локальную точку монтирования
+sshfs $ZBACKUP_USER@$SERVER_ADDRESS:$SERVER_MOUNT_POINT $LOCAL_MOUNT_POINT -p $SERVER_SSH_PORT -o idmap=user -o IdentityFile=~/.ssh/id_"$ZBACKUP_USER"_zbackup -o nonempty 2>/dev/null
+## Для увеличения производительности восстановления вводим вручную количество ОЗУ для zbackup
+FREE_MEM=$( free -m | grep 'buffers/cache' | awk '{print $4}')
+echo "На системе свободно $FREE_MEM Мбайт ОЗУ. Введите сколько выделить для zbackup для ускорения процесса - в Мбайтах: "
+read USE_MEM
+echo "Используется $USE_MEM Мбайт для zbackup…"
+
+## Выводим список файлов для восстановления
+ls -l $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/lvm/$VG/$LV/
+
+## Вручную вводим нужный файл
+echo "Введите имя файла для восстановления…"
+read FILE
+echo "Восстанавливаем $FILE…"
+sleep 2
+
+## Восстанавливаем раздел из архива в бинарном виде
+zbackup --cache-size "$USE_MEM"mb restore $LOCAL_MOUNT_POINT/zbackup/backups/$ZBACKUP_USER/lvm/$VG/$LV/$FILE | dd of=$LV_PARTITION bs=10M conv=noerror
+
+## Отмонтируем удалённый каталог
+fusermount -u $LOCAL_MOUNT_POINT
+
+
+
+
+
+https://help.ubuntu.com/community/SSHFS
+
